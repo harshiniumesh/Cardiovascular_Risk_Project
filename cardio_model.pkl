@@ -1,0 +1,141 @@
+"""
+Cardiovascular Risk Prediction — Flask API
+Supports BOTH:
+  • TensorFlow/Keras .keras model (production, after running train_model.py)
+  • Sklearn pickle   .pkl  model  (demo,       after running train_demo.py)
+"""
+
+import os, json, pickle, traceback
+import numpy as np
+from flask import Flask, request, jsonify, send_from_directory
+
+try:
+    from flask_cors import CORS
+    HAS_CORS = True
+except ImportError:
+    HAS_CORS = False
+
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR  = os.path.join(BASE_DIR, 'model')
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
+
+FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'frontend'))
+FRONTEND_PAGES_DIR = os.path.join(FRONTEND_DIR, 'pages')
+FRONTEND_STATIC_DIR = FRONTEND_DIR  # contains css/ and js/ and index.html
+
+app = Flask(__name__, static_folder=STATIC_DIR, template_folder=None)
+
+if HAS_CORS:
+    CORS(app)
+
+else:
+    @app.after_request
+    def add_cors(response):
+        response.headers['Access-Control-Allow-Origin']  = '*'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+        return response
+    @app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+    @app.route('/<path:path>', methods=['OPTIONS'])
+    def handle_options(path): return '', 204
+
+model = scaler = model_meta = model_type = None
+
+def load_artefacts():
+    global model, scaler, model_meta, model_type
+    keras_path  = os.path.join(MODEL_DIR, 'cardio_model.keras')
+    pkl_path    = os.path.join(MODEL_DIR, 'cardio_model.pkl')
+    scaler_path = os.path.join(MODEL_DIR, 'scaler.pkl')
+    meta_path   = os.path.join(MODEL_DIR, 'model_meta.json')
+
+    if os.path.exists(keras_path):
+        try:
+            import tensorflow as tf
+            model = tf.keras.models.load_model(keras_path)
+            model_type = 'tf'
+            print("[INFO] TensorFlow model loaded.")
+        except Exception as e:
+            print(f"[WARN] TF load failed: {e}")
+
+    if model is None and os.path.exists(pkl_path):
+        with open(pkl_path, 'rb') as f: model = pickle.load(f)
+        model_type = 'sklearn'
+        print("[INFO] Sklearn demo model loaded.")
+
+    if model is None:
+        print("[WARN] No model found. Run train_demo.py first.")
+        return False
+
+    with open(scaler_path,'rb') as f: scaler = pickle.load(f)
+    with open(meta_path,'r')    as f: model_meta = json.load(f)
+    print(f"[INFO] Ready. type={model_type} features={model_meta['feature_names']}")
+    return True
+
+ready = load_artefacts()
+
+@app.route('/api/health')
+def health(): return jsonify({'status':'ok','model_ready':ready,'model_type':model_type})
+
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    if not ready: return jsonify({'error':'Model not loaded.'}), 503
+    try:
+        data = request.get_json(force=True)
+        def get(k,d=0):
+            v=data.get(k,d); return float(v) if v not in (None,'') else float(d)
+        feature_order = model_meta['feature_names']
+        fm = {k: get(k) for k in ['age','sex','cp','trestbps','chol','fbs',
+                                    'restecg','thalach','exang','oldpeak','slope','ca','thal']}
+        features = np.array([[fm[f] for f in feature_order]])
+        fs = scaler.transform(features)
+        if model_type == 'tf':
+            fc = fs.reshape(1, fs.shape[1], 1)
+            prob = float(model.predict(fc, verbose=0)[0][0])
+        else:
+            prob = float(model.predict_proba(fs)[0][1])
+        risk = 'High Risk' if prob >= 0.5 else 'Low Risk'
+        tips = generate_tips(fm, risk)
+        return jsonify({'risk':risk,'probability':round(prob*100,1),'tips':tips})
+    except Exception as e:
+        traceback.print_exc(); return jsonify({'error':str(e)}), 500
+
+def generate_tips(fm, risk):
+    tips = []
+    if fm['age']>60:       tips.append("Regular cardiovascular check-ups are crucial after 60.")
+    if fm['chol']>240:     tips.append("Elevated cholesterol detected. Consider a low-fat diet and aerobic exercise.")
+    if fm['trestbps']>140: tips.append("High blood pressure. Reduce sodium intake and manage stress.")
+    if fm['fbs']==1:       tips.append("Elevated fasting blood sugar — monitor glucose levels regularly.")
+    if fm['exang']==1:     tips.append("Exercise-induced chest pain warrants a cardiology stress-echo evaluation.")
+    if fm['sex']==1 and fm['age']>45: tips.append("Men over 45 have elevated baseline risk — annual screening advised.")
+    tips.insert(0,"⚠️ Please consult a cardiologist promptly for a thorough evaluation." if risk=='High Risk'
+                  else "✅ Keep up healthy habits: balanced diet, regular exercise, no smoking.")
+    return tips[:4]
+
+@app.route('/api/model-metrics')
+def model_metrics():
+    if not ready: return jsonify({'error':'Model not loaded.'}), 503
+    return jsonify({'accuracy':model_meta.get('accuracy'),'roc_auc':model_meta.get('roc_auc'),
+                    'confusion_matrix':model_meta.get('confusion_matrix'),
+                    'n_features':model_meta.get('n_features'),
+                    'feature_names':model_meta.get('feature_names')})
+
+@app.route('/api/chart-data')
+def chart_data():
+    p=os.path.join(STATIC_DIR,'chart_data.json')
+    if not os.path.exists(p): return jsonify({'error':'Run training first.'}),404
+    with open(p) as f: return jsonify(json.load(f))
+
+@app.route('/static/<path:filename>')
+def serve_static(filename): return send_from_directory(STATIC_DIR,filename)
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_frontend(path):
+    if path and os.path.exists(os.path.join(FRONTEND_DIR, path)):
+        return send_from_directory(FRONTEND_DIR, path)
+    return send_from_directory(FRONTEND_DIR, 'index.html')
+
+
+if __name__=='__main__':
+    print("\n"+"="*50+"\n  CardioSense AI — http://127.0.0.1:5000\n"+"="*50+"\n")
+    app.run(debug=True, host='0.0.0.0', port=5000)

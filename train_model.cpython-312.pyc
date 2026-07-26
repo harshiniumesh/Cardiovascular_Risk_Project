@@ -1,0 +1,408 @@
+"""
+Cardiovascular Risk Prediction - 1D CNN Model Training
+Dataset: UCI Heart Disease (Cleveland) via sklearn / synthetic generation
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, roc_curve, auc, classification_report
+)
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import pickle
+import json
+import os
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ─── Reproducibility ───────────────────────────────────────────────────────────
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# ─── Paths ─────────────────────────────────────────────────────────────────────
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, '..', 'static')
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+# ─── 1. Load / Generate Dataset ────────────────────────────────────────────────
+def load_dataset():
+    """
+    Try to load the UCI Heart Disease dataset.
+    Falls back to a realistic synthetic dataset if unavailable.
+    """
+    uci_url = (
+        "https://archive.ics.uci.edu/ml/machine-learning-databases/"
+        "heart-disease/processed.cleveland.data"
+    )
+    cols = [
+        'age','sex','cp','trestbps','chol','fbs','restecg',
+        'thalach','exang','oldpeak','slope','ca','thal','target'
+    ]
+    try:
+        df = pd.read_csv(uci_url, header=None, names=cols, na_values='?')
+        df['target'] = (df['target'] > 0).astype(int)
+        print("[INFO] UCI dataset loaded.")
+        return df
+    except Exception:
+        print("[WARN] UCI fetch failed – generating synthetic dataset.")
+        return generate_synthetic_dataset()
+
+
+def generate_synthetic_dataset(n=1500):
+    """
+    Generate a realistic synthetic cardiovascular dataset.
+    Feature distributions are calibrated to mirror UCI Heart Disease statistics.
+    """
+    rng = np.random.RandomState(42)
+
+    age        = rng.normal(54, 9, n).clip(29, 77).astype(int)
+    sex        = rng.randint(0, 2, n)                         # 0=F, 1=M
+    cp         = rng.choice([0,1,2,3], n, p=[0.47,0.17,0.28,0.08])
+    trestbps   = rng.normal(131, 18, n).clip(94, 200).astype(int)
+    chol       = rng.normal(246, 52, n).clip(126, 564).astype(int)
+    fbs        = (rng.random(n) < 0.15).astype(int)
+    restecg    = rng.choice([0,1,2], n, p=[0.48,0.02,0.50])
+    thalach    = rng.normal(149, 23, n).clip(71, 202).astype(int)
+    exang      = (rng.random(n) < 0.33).astype(int)
+    oldpeak    = np.abs(rng.normal(1.04, 1.16, n)).clip(0, 6.2).round(1)
+    slope      = rng.choice([0,1,2], n, p=[0.07,0.46,0.47])
+    ca         = rng.choice([0,1,2,3], n, p=[0.59,0.22,0.12,0.07])
+    thal       = rng.choice([1,2,3], n, p=[0.06,0.55,0.39])
+
+    # Risk score with clinically informed weights
+    risk_score = (
+        0.04 * age
+        + 0.3  * sex
+        + 0.4  * cp
+        + 0.01 * trestbps
+        + 0.004* chol
+        + 0.2  * fbs
+        - 0.01 * thalach
+        + 0.5  * exang
+        + 0.3  * oldpeak
+        - 0.2  * slope
+        + 0.4  * ca
+        + 0.3  * (thal == 2).astype(int)
+        + rng.normal(0, 0.5, n)
+    )
+    target = (risk_score > np.percentile(risk_score, 50)).astype(int)
+
+    df = pd.DataFrame({
+        'age': age, 'sex': sex, 'cp': cp, 'trestbps': trestbps,
+        'chol': chol, 'fbs': fbs, 'restecg': restecg, 'thalach': thalach,
+        'exang': exang, 'oldpeak': oldpeak, 'slope': slope,
+        'ca': ca, 'thal': thal, 'target': target
+    })
+    return df
+
+
+# ─── 2. Preprocessing ──────────────────────────────────────────────────────────
+def preprocess(df):
+    """Handle missing values, encode, and normalise."""
+    df = df.copy()
+
+    # Drop rows where too many values are missing
+    df.dropna(thresh=len(df.columns) - 2, inplace=True)
+
+    # Fill remaining NaNs with column median
+    for col in df.columns:
+        if df[col].isnull().any():
+            df[col].fillna(df[col].median(), inplace=True)
+
+    # Binary encode 'thal' (present as floats in UCI)
+    df['thal'] = df['thal'].astype(int)
+
+    feature_cols = [c for c in df.columns if c != 'target']
+    X = df[feature_cols].values
+    y = df['target'].values
+
+    return X, y, feature_cols
+
+
+# ─── 3. Scale + Reshape for 1D CNN ─────────────────────────────────────────────
+def prepare_for_cnn(X_train, X_test, feature_names):
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled  = scaler.transform(X_test)
+
+    # 1D CNN expects (samples, timesteps, channels) → treat each feature as a timestep
+    X_train_cnn = X_train_scaled.reshape(X_train_scaled.shape[0], X_train_scaled.shape[1], 1)
+    X_test_cnn  = X_test_scaled.reshape(X_test_scaled.shape[0],  X_test_scaled.shape[1],  1)
+
+    return X_train_cnn, X_test_cnn, scaler
+
+
+# ─── 4. Build 1D CNN ───────────────────────────────────────────────────────────
+def build_cnn(input_shape):
+    """
+    1D CNN architecture for tabular cardiovascular data.
+    Each feature is treated as a 'time step' in a 1-channel sequence.
+    """
+    model = keras.Sequential([
+        # Block 1
+        layers.Conv1D(64, kernel_size=3, activation='relu',
+                      padding='same', input_shape=input_shape),
+        layers.BatchNormalization(),
+        layers.Conv1D(64, kernel_size=3, activation='relu', padding='same'),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Dropout(0.25),
+
+        # Block 2
+        layers.Conv1D(128, kernel_size=3, activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.Conv1D(128, kernel_size=3, activation='relu', padding='same'),
+        layers.GlobalAveragePooling1D(),
+        layers.Dropout(0.30),
+
+        # Classifier head
+        layers.Dense(128, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.40),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(1, activation='sigmoid')
+    ], name='CardioRisk_1DCNN')
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        loss='binary_crossentropy',
+        metrics=['accuracy', keras.metrics.AUC(name='auc')]
+    )
+    return model
+
+
+# ─── 5. Train ──────────────────────────────────────────────────────────────────
+def train(model, X_train, y_train, X_val, y_val):
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor='val_auc', patience=20, restore_best_weights=True, mode='max'
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5, patience=8, min_lr=1e-6
+        ),
+    ]
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=150,
+        batch_size=32,
+        callbacks=callbacks,
+        verbose=1
+    )
+    return history
+
+
+# ─── 6. Evaluation Plots ───────────────────────────────────────────────────────
+def save_evaluation_plots(model, X_test, y_test, history):
+    y_pred_prob = model.predict(X_test, verbose=0).flatten()
+    y_pred      = (y_pred_prob >= 0.5).astype(int)
+    acc         = accuracy_score(y_test, y_pred)
+    cm          = confusion_matrix(y_test, y_pred)
+    fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
+    roc_auc     = auc(fpr, tpr)
+
+    print(f"\n[EVAL] Accuracy : {acc:.4f}")
+    print(f"[EVAL] ROC-AUC  : {roc_auc:.4f}")
+    print(classification_report(y_test, y_pred, target_names=['Low Risk','High Risk']))
+
+    # ── Confusion Matrix ────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(5, 4), facecolor='#0f172a')
+    ax.set_facecolor('#1e293b')
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Low Risk','High Risk'],
+                yticklabels=['Low Risk','High Risk'],
+                ax=ax, cbar=False,
+                annot_kws={'size':14, 'weight':'bold', 'color':'white'})
+    ax.set_xlabel('Predicted', color='#94a3b8', fontsize=11)
+    ax.set_ylabel('Actual',    color='#94a3b8', fontsize=11)
+    ax.set_title('Confusion Matrix', color='white', fontsize=13, pad=10)
+    ax.tick_params(colors='#94a3b8')
+    plt.tight_layout()
+    plt.savefig(os.path.join(STATIC_DIR, 'confusion_matrix.png'),
+                dpi=150, bbox_inches='tight', facecolor='#0f172a')
+    plt.close()
+
+    # ── ROC Curve ────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(5, 4), facecolor='#0f172a')
+    ax.set_facecolor('#1e293b')
+    ax.plot(fpr, tpr, color='#f43f5e', lw=2.5,
+            label=f'AUC = {roc_auc:.3f}')
+    ax.plot([0,1],[0,1], color='#475569', lw=1, linestyle='--')
+    ax.fill_between(fpr, tpr, alpha=0.15, color='#f43f5e')
+    ax.set_xlim([0,1]); ax.set_ylim([0,1.02])
+    ax.set_xlabel('False Positive Rate', color='#94a3b8', fontsize=10)
+    ax.set_ylabel('True Positive Rate',  color='#94a3b8', fontsize=10)
+    ax.set_title('ROC Curve', color='white', fontsize=13, pad=10)
+    ax.legend(loc='lower right', facecolor='#334155', edgecolor='none',
+              labelcolor='white')
+    ax.tick_params(colors='#94a3b8')
+    ax.spines[:].set_color('#334155')
+    plt.tight_layout()
+    plt.savefig(os.path.join(STATIC_DIR, 'roc_curve.png'),
+                dpi=150, bbox_inches='tight', facecolor='#0f172a')
+    plt.close()
+
+    # ── Training History ─────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), facecolor='#0f172a')
+    for ax in axes:
+        ax.set_facecolor('#1e293b')
+        ax.tick_params(colors='#94a3b8')
+        ax.spines[:].set_color('#334155')
+    axes[0].plot(history.history['accuracy'],     color='#38bdf8', label='Train')
+    axes[0].plot(history.history['val_accuracy'], color='#f43f5e', label='Val')
+    axes[0].set_title('Accuracy', color='white'); axes[0].legend(labelcolor='white', facecolor='#334155', edgecolor='none')
+    axes[0].set_xlabel('Epoch', color='#94a3b8'); axes[0].set_ylabel('Accuracy', color='#94a3b8')
+    axes[1].plot(history.history['loss'],     color='#38bdf8', label='Train')
+    axes[1].plot(history.history['val_loss'], color='#f43f5e', label='Val')
+    axes[1].set_title('Loss', color='white'); axes[1].legend(labelcolor='white', facecolor='#334155', edgecolor='none')
+    axes[1].set_xlabel('Epoch', color='#94a3b8'); axes[1].set_ylabel('Loss', color='#94a3b8')
+    plt.tight_layout()
+    plt.savefig(os.path.join(STATIC_DIR, 'training_history.png'),
+                dpi=150, bbox_inches='tight', facecolor='#0f172a')
+    plt.close()
+
+    return {
+        'accuracy': round(float(acc), 4),
+        'roc_auc':  round(float(roc_auc), 4),
+        'confusion_matrix': cm.tolist()
+    }
+
+
+# ─── 7. Analysis Plots (for the Analytics page) ────────────────────────────────
+def save_analysis_plots(df):
+    """Age vs Risk, Cholesterol vs Risk, Feature Correlation Heatmap."""
+
+    # Age distribution by risk
+    fig, ax = plt.subplots(figsize=(7, 4), facecolor='#0f172a')
+    ax.set_facecolor('#1e293b')
+    for risk, color, label in [(0,'#38bdf8','Low Risk'),(1,'#f43f5e','High Risk')]:
+        subset = df[df['target'] == risk]['age']
+        ax.hist(subset, bins=15, alpha=0.75, color=color, label=label, edgecolor='none')
+    ax.set_xlabel('Age', color='#94a3b8'); ax.set_ylabel('Count', color='#94a3b8')
+    ax.set_title('Age Distribution by Cardiovascular Risk', color='white', fontsize=12)
+    ax.legend(facecolor='#334155', edgecolor='none', labelcolor='white')
+    ax.tick_params(colors='#94a3b8'); ax.spines[:].set_color('#334155')
+    plt.tight_layout()
+    plt.savefig(os.path.join(STATIC_DIR, 'age_vs_risk.png'),
+                dpi=150, bbox_inches='tight', facecolor='#0f172a')
+    plt.close()
+
+    # Cholesterol scatter
+    fig, ax = plt.subplots(figsize=(7, 4), facecolor='#0f172a')
+    ax.set_facecolor('#1e293b')
+    for risk, color, label in [(0,'#38bdf8','Low Risk'),(1,'#f43f5e','High Risk')]:
+        subset = df[df['target'] == risk]
+        ax.scatter(subset['age'], subset['chol'],
+                   alpha=0.5, color=color, s=18, label=label)
+    ax.set_xlabel('Age',         color='#94a3b8')
+    ax.set_ylabel('Cholesterol', color='#94a3b8')
+    ax.set_title('Age vs Cholesterol by Risk Level', color='white', fontsize=12)
+    ax.legend(facecolor='#334155', edgecolor='none', labelcolor='white')
+    ax.tick_params(colors='#94a3b8'); ax.spines[:].set_color('#334155')
+    plt.tight_layout()
+    plt.savefig(os.path.join(STATIC_DIR, 'chol_vs_risk.png'),
+                dpi=150, bbox_inches='tight', facecolor='#0f172a')
+    plt.close()
+
+    # Correlation heatmap
+    corr = df.corr()
+    fig, ax = plt.subplots(figsize=(9, 7), facecolor='#0f172a')
+    ax.set_facecolor('#1e293b')
+    mask = np.zeros_like(corr, dtype=bool)
+    mask[np.triu_indices_from(mask)] = True
+    sns.heatmap(corr, mask=mask, cmap='coolwarm', center=0,
+                annot=True, fmt='.2f', linewidths=0.5,
+                annot_kws={'size': 7}, ax=ax,
+                cbar_kws={'shrink': 0.8})
+    ax.set_title('Feature Correlation Heatmap', color='white', fontsize=13, pad=12)
+    ax.tick_params(colors='#94a3b8', labelsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(STATIC_DIR, 'correlation_heatmap.png'),
+                dpi=150, bbox_inches='tight', facecolor='#0f172a')
+    plt.close()
+
+    # Risk rate by age group (bar chart data for Chart.js)
+    df['age_group'] = pd.cut(df['age'], bins=[20,30,40,50,60,70,80],
+                             labels=['20s','30s','40s','50s','60s','70s+'])
+    risk_by_age = df.groupby('age_group', observed=True)['target'].mean().round(3)
+
+    # Risk rate by cholesterol band
+    df['chol_band'] = pd.cut(df['chol'],
+                             bins=[0, 200, 240, 300, 600],
+                             labels=['<200','200-240','240-300','>300'])
+    risk_by_chol = df.groupby('chol_band', observed=True)['target'].mean().round(3)
+
+    chart_data = {
+        'age_labels':       risk_by_age.index.astype(str).tolist(),
+        'age_risk_rates':   risk_by_age.values.tolist(),
+        'chol_labels':      risk_by_chol.index.astype(str).tolist(),
+        'chol_risk_rates':  risk_by_chol.values.tolist(),
+    }
+    with open(os.path.join(STATIC_DIR, 'chart_data.json'), 'w') as f:
+        json.dump(chart_data, f)
+    print("[INFO] Analysis plots and chart data saved.")
+
+
+# ─── 8. Main ───────────────────────────────────────────────────────────────────
+def main():
+    print("=" * 60)
+    print("  Cardiovascular Risk Prediction – Model Training")
+    print("=" * 60)
+
+    # Load & preprocess
+    df  = load_dataset()
+    print(f"[INFO] Dataset shape: {df.shape}")
+    X, y, feature_names = preprocess(df)
+    print(f"[INFO] Features ({len(feature_names)}): {feature_names}")
+    print(f"[INFO] Class distribution → 0: {(y==0).sum()}  1: {(y==1).sum()}")
+
+    # Save analysis plots BEFORE splitting
+    save_analysis_plots(df)
+
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=42, stratify=y
+    )
+    X_train_cnn, X_test_cnn, scaler = prepare_for_cnn(X_train, X_test, feature_names)
+
+    # Build & train
+    model = build_cnn(input_shape=(X_train_cnn.shape[1], 1))
+    model.summary()
+    history = train(model, X_train_cnn, y_train, X_test_cnn, y_test)
+
+    # Evaluate
+    metrics = save_evaluation_plots(model, X_test_cnn, y_test, history)
+
+    # Save artefacts
+    model_path  = os.path.join(BASE_DIR, 'cardio_model.keras')
+    scaler_path = os.path.join(BASE_DIR, 'scaler.pkl')
+    meta_path   = os.path.join(BASE_DIR, 'model_meta.json')
+
+    model.save(model_path)
+    with open(scaler_path, 'wb') as f:
+        pickle.dump(scaler, f)
+
+    meta = {
+        'feature_names': feature_names,
+        'n_features':    len(feature_names),
+        'accuracy':      metrics['accuracy'],
+        'roc_auc':       metrics['roc_auc'],
+        'confusion_matrix': metrics['confusion_matrix']
+    }
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+
+    print("\n[DONE] Saved:")
+    print(f"  Model   → {model_path}")
+    print(f"  Scaler  → {scaler_path}")
+    print(f"  Meta    → {meta_path}")
+    print(f"  Accuracy: {metrics['accuracy']:.4f}  |  AUC: {metrics['roc_auc']:.4f}")
+
+
+if __name__ == '__main__':
+    main()
