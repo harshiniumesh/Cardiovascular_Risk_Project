@@ -1,0 +1,109 @@
+/**
+ * CardioSense AI — Analytics Page JS
+ * Fetches chart data from the API and renders Chart.js bar charts.
+ */
+
+const API_BASE = '';
+
+
+const CHART_DEFAULTS = {
+  responsive: true,
+  plugins: {
+    legend: { display: false },
+    tooltip: {
+      backgroundColor: '#1e293b',
+      borderColor: '#2d4a6a',
+      borderWidth: 1,
+      titleColor: '#e2e8f0',
+      bodyColor: '#94a3b8',
+      callbacks: {
+        label: ctx => ` Risk Rate: ${(ctx.raw * 100).toFixed(1)}%`
+      }
+    }
+  },
+  scales: {
+    x: {
+      grid: { color: '#1e293b' },
+      ticks: { color: '#64748b' }
+    },
+    y: {
+      grid: { color: '#1e293b' },
+      ticks: {
+        color: '#64748b',
+        callback: v => `${(v * 100).toFixed(0)}%`
+      },
+      min: 0, max: 1
+    }
+  }
+};
+
+async function loadCharts() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/chart-data`);
+    if (!resp.ok) throw new Error('Chart data not available.');
+    const data = await resp.json();
+
+    // ── Age Risk Chart ─────────────────────────────────────────
+    new Chart(document.getElementById('ageChart'), {
+      type: 'bar',
+      data: {
+        labels: data.age_labels,
+        datasets: [{
+          label: 'Risk Rate',
+          data: data.age_risk_rates,
+          backgroundColor: data.age_risk_rates.map(v =>
+            v < 0.3  ? 'rgba(52,211,153,0.7)'  :
+            v < 0.55 ? 'rgba(251,191,36,0.7)'  :
+                       'rgba(244,63,94,0.7)'
+          ),
+          borderColor: data.age_risk_rates.map(v =>
+            v < 0.3  ? '#34d399' : v < 0.55 ? '#fbbf24' : '#f43f5e'
+          ),
+          borderWidth: 1,
+          borderRadius: 6,
+        }]
+      },
+      options: CHART_DEFAULTS
+    });
+
+    // ── Cholesterol Risk Chart ─────────────────────────────────
+    new Chart(document.getElementById('cholChart'), {
+      type: 'bar',
+      data: {
+        labels: data.chol_labels,
+        datasets: [{
+          label: 'Risk Rate',
+          data: data.chol_risk_rates,
+          backgroundColor: data.chol_risk_rates.map(v =>
+            v < 0.3  ? 'rgba(56,189,248,0.7)'  :
+            v < 0.55 ? 'rgba(251,191,36,0.7)'  :
+                       'rgba(244,63,94,0.7)'
+          ),
+          borderColor: data.chol_risk_rates.map(v =>
+            v < 0.3  ? '#38bdf8' : v < 0.55 ? '#fbbf24' : '#f43f5e'
+          ),
+          borderWidth: 1,
+          borderRadius: 6,
+        }]
+      },
+      options: CHART_DEFAULTS
+    });
+
+  } catch (err) {
+    console.error('[Analytics]', err);
+    showWarning(err.message);
+  }
+}
+
+function showWarning(msg) {
+  const warn = document.createElement('div');
+  warn.style.cssText = `
+    margin:1rem auto; max-width:600px; padding:0.9rem 1.2rem;
+    background:rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.3);
+    border-radius:10px; color:#fbbf24; font-size:0.875rem; text-align:center;
+  `;
+  warn.textContent = `⚠️ ${msg} — start the backend to see live charts.`;
+  document.querySelector('.container').prepend(warn);
+}
+
+loadCharts();

@@ -1,0 +1,212 @@
+/**
+ * CardioSense AI — Prediction Page JS
+ * Handles form validation, API call, spinner, gauge, and result display.
+ */
+
+const API_BASE = '';
+
+
+// ─── Form Validation ───────────────────────────────────────────
+const RULES = {
+  age:      { min: 20, max: 100, msg: 'Age must be between 20 and 100.' },
+  trestbps: { min: 80, max: 220, msg: 'Blood pressure must be 80–220 mm Hg.' },
+  chol:     { min: 100, max: 600, msg: 'Cholesterol must be 100–600 mg/dL.' },
+  thalach:  { min: 60, max: 220, msg: 'Heart rate must be 60–220 bpm.' },
+  oldpeak:  { min: 0,  max: 6.2, msg: 'ST Depression must be 0.0–6.2.' },
+};
+
+function validateField(id, value) {
+  const errEl = document.getElementById(`err-${id}`);
+  const input = document.getElementById(id);
+  if (!errEl || !input) return true;
+
+  if (value === '' || value === null) {
+    input.classList.add('invalid');
+    errEl.textContent = 'This field is required.';
+    return false;
+  }
+  if (RULES[id]) {
+    const num = parseFloat(value);
+    if (isNaN(num) || num < RULES[id].min || num > RULES[id].max) {
+      input.classList.add('invalid');
+      errEl.textContent = RULES[id].msg;
+      return false;
+    }
+  }
+  input.classList.remove('invalid');
+  errEl.textContent = '';
+  return true;
+}
+
+function validateForm(formData) {
+  let valid = true;
+  const fields = ['age','sex','cp','trestbps','chol','fbs','restecg',
+                  'thalach','exang','oldpeak','slope','ca','thal'];
+  fields.forEach(id => {
+    if (!validateField(id, formData[id])) valid = false;
+  });
+  return valid;
+}
+
+// Clear validation on input
+document.querySelectorAll('input, select').forEach(el => {
+  el.addEventListener('input', () => {
+    el.classList.remove('invalid');
+    const errEl = document.getElementById(`err-${el.id}`);
+    if (errEl) errEl.textContent = '';
+  });
+});
+
+// ─── Form Submit ──────────────────────────────────────────────
+document.getElementById('riskForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const form = e.target;
+  const rawData = Object.fromEntries(new FormData(form));
+
+  if (!validateForm(rawData)) return;
+
+  setLoading(true);
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/predict`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(rawData),
+    });
+    if (!resp.ok) throw new Error(`Server error: ${resp.status}`);
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    showResult(data);
+  } catch (err) {
+    console.error(err);
+    showError(err.message);
+  } finally {
+    setLoading(false);
+  }
+});
+
+// ─── Loading State ─────────────────────────────────────────────
+function setLoading(on) {
+  const btn      = document.getElementById('submitBtn');
+  const spinner  = btn.querySelector('.btn-spinner');
+  const btnText  = btn.querySelector('.btn-text');
+  const btnIcon  = btn.querySelector('.btn-icon');
+
+  btn.disabled       = on;
+  spinner.hidden     = !on;
+  btnText.textContent = on ? 'Analysing…' : 'Analyse Risk';
+  btnIcon.hidden     = on;
+}
+
+// ─── Show Result ──────────────────────────────────────────────
+function showResult(data) {
+  const isHigh   = data.risk === 'High Risk';
+  const prob     = data.probability;  // 0–100
+  const lowProb  = isHigh ? (100 - prob) : prob;
+  const highProb = isHigh ? prob : (100 - prob);
+
+  // Hide form, show result card
+  document.getElementById('riskForm').hidden   = true;
+  const card = document.getElementById('resultCard');
+  card.hidden = false;
+
+  // Icon & label
+  const icon  = document.getElementById('resultIcon');
+  const label = document.getElementById('resultLabel');
+  icon.textContent = isHigh ? '🔴' : '🟢';
+  icon.className   = `result-icon ${isHigh ? 'high' : 'low'}`;
+  label.textContent = data.risk;
+  label.className   = `result-label ${isHigh ? 'high' : 'low'}`;
+
+  // Draw gauge
+  drawGauge(prob / 100, isHigh);
+  document.getElementById('gaugeValue').textContent = `${prob.toFixed(1)}%`;
+
+  // Bars (animate on next frame)
+  setTimeout(() => {
+    document.getElementById('barLow').style.width  = `${lowProb}%`;
+    document.getElementById('barHigh').style.width = `${highProb}%`;
+  }, 80);
+  document.getElementById('pctLow').textContent  = `${lowProb.toFixed(1)}%`;
+  document.getElementById('pctHigh').textContent = `${highProb.toFixed(1)}%`;
+
+  // Tips
+  const tipsList = document.getElementById('tipsList');
+  tipsList.innerHTML = data.tips
+    .map(t => `<li>${t}</li>`)
+    .join('');
+}
+
+// ─── Gauge Drawing ────────────────────────────────────────────
+function drawGauge(value, isHigh) {
+  const canvas = document.getElementById('gaugeCanvas');
+  const ctx    = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const cx = W / 2, cy = H - 16;
+  const r  = 100;
+  const startAngle = Math.PI;
+  const endAngle   = 2 * Math.PI;
+
+  // Track
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, startAngle, endAngle);
+  ctx.lineWidth = 14; ctx.strokeStyle = '#1e293b';
+  ctx.lineCap = 'round'; ctx.stroke();
+
+  // Fill
+  const fillEnd = startAngle + value * Math.PI;
+  const gradient = ctx.createLinearGradient(cx - r, cy, cx + r, cy);
+  gradient.addColorStop(0, '#34d399');
+  gradient.addColorStop(0.5, '#fbbf24');
+  gradient.addColorStop(1, '#f43f5e');
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, startAngle, fillEnd);
+  ctx.lineWidth = 14; ctx.strokeStyle = gradient;
+  ctx.lineCap = 'round'; ctx.stroke();
+
+  // Needle
+  const angle = startAngle + value * Math.PI;
+  const nx = cx + (r - 20) * Math.cos(angle);
+  const ny = cy + (r - 20) * Math.sin(angle);
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(nx, ny);
+  ctx.lineWidth = 3; ctx.strokeStyle = '#e2e8f0';
+  ctx.lineCap = 'round'; ctx.stroke();
+
+  // Centre dot
+  ctx.beginPath();
+  ctx.arc(cx, cy, 5, 0, 2 * Math.PI);
+  ctx.fillStyle = '#e2e8f0'; ctx.fill();
+}
+
+// ─── Error display ────────────────────────────────────────────
+function showError(msg) {
+  const existing = document.getElementById('apiError');
+  if (existing) existing.remove();
+  const el = document.createElement('div');
+  el.id = 'apiError';
+  el.style.cssText = `
+    margin-top:1rem; padding:0.9rem 1.2rem;
+    background:rgba(244,63,94,0.12);
+    border:1px solid rgba(244,63,94,0.3);
+    border-radius:10px; color:#f87171; font-size:0.875rem;
+  `;
+  el.innerHTML = `⚠️ <strong>API Error:</strong> ${msg}<br/><small style="opacity:.7">Ensure the backend is running: <code>python backend/app.py</code></small>`;
+  document.getElementById('riskForm').after(el);
+}
+
+// ─── Reset ────────────────────────────────────────────────────
+function resetForm() {
+  document.getElementById('riskForm').hidden   = false;
+  document.getElementById('resultCard').hidden  = true;
+  const errEl = document.getElementById('apiError');
+  if (errEl) errEl.remove();
+
+  // Reset bars
+  document.getElementById('barLow').style.width  = '0';
+  document.getElementById('barHigh').style.width = '0';
+}
